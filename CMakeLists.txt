@@ -79,3 +79,30 @@ target_link_libraries(horizon_tests
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags)
+
+# Listening/measurement tool: renders every room's IR and a clap to WAV and
+# prints echo density, clarity and late-field ripple per room.
+juce_add_console_app(horizon_audition PRODUCT_NAME "horizon_audition")
+
+target_sources(horizon_audition PRIVATE
+    test/Audition.cpp
+    src/PluginProcessor.cpp
+    src/PluginEditor.cpp
+    src/ui/ReverbDisplay.cpp)
+
+target_include_directories(horizon_audition PRIVATE src)
+
+target_compile_definitions(horizon_audition PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_MODAL_LOOPS_PERMITTED=0)
+
+target_link_libraries(horizon_audition
+    PRIVATE
+        jdm_shared
+        juce::juce_audio_utils
+        juce::juce_dsp
+        juce::juce_opengl
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
