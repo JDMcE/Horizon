@@ -1,0 +1,15 @@
+# Build output
+build/
+
+# Vendored dependencies (clone them as described in README.md)
+libs/JUCE/
+
+# IDE / editor files
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Local planning notes (not published)
+Development_Plan.md
+features.txt
