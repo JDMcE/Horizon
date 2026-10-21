@@ -44,11 +44,15 @@ the **Equinox Audio** family alongside [Equinox](https://github.com/JDMcE/Equino
 Download the latest build from the
 [Releases page](https://github.com/JDMcE/Horizon/releases).
 
-**Windows (64-bit VST3):**
+**Windows plugin (64-bit VST3):**
 
-1. Unzip the download.
+1. Download `Horizon-<version>-win64-vst3.zip` and unzip it.
 2. Copy `Horizon.vst3` into `C:\Program Files\Common Files\VST3\`.
 3. Restart your DAW or rescan plugins. Horizon appears under **Equinox Audio**.
+
+**Windows standalone app:** no DAW needed. Download
+`Horizon-<version>-win64-standalone.zip`, unzip it and run `Horizon.exe`. Pick your audio
+device under **Options → Audio/MIDI Settings**.
 
 Prebuilt releases are Windows-only for now. On other platforms you can build from
 source (see [For developers](#for-developers)).
