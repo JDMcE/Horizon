@@ -11,6 +11,10 @@
 namespace hrzn::ir
 {
 
+// The early envelope's resolution: 5 ms bins over the first 160 ms.
+inline constexpr int numEarlyEnvBins = 32;
+inline constexpr double earlyEnvBinSeconds = 0.005;
+
 // Impulse response analysis (feature 6), v0.6.
 //
 // This half of the IR feature is deliberately *pure*: it takes a block of
@@ -84,6 +88,15 @@ struct Features
     // space, which is what "how big is this room" needs to look like if a
     // search is going to walk it.
     float earlyCentreMs = 0.0f;
+
+    // Time by which 80% of the same energy has arrived, ms (v0.9). The centre
+    // alone stopped ranking the halls once their reflections became
+    // front-loaded: half the early energy is in before the long taps that say
+    // how big the hall is have arrived. The later quantile still hears them.
+    float earlyTailMs = 0.0f;
+
+    // The early energy envelope, as QuickStats::earlyEnvDb.
+    std::array<float, numEarlyEnvBins> earlyEnvDb {};
 
     // Band level with each band's own decay divided out, in dB relative to the
     // mean across bands — so a flat response reads zero everywhere whatever
@@ -333,9 +346,16 @@ struct QuickStats
     float peak = 0.0f;
     float onsetSeconds = 0.0f;
     float earlyCentreMs = 0.0f;
+    float earlyTailMs = 0.0f;
     float echoDensityMs = 0.0f;
     float earlyLateDb = 0.0f;
     size_t onsetSample = 0;
+
+    // Energy per 5 ms bin after onset, in dB against the loudest bin, floored
+    // at -40 (v0.9). The scalar measurements summarise the early field; this
+    // keeps its *pattern*, which is what still tells a studio from a small hall
+    // heard from close up when every summary of the two agrees.
+    std::array<float, numEarlyEnvBins> earlyEnvDb {};
 };
 
 inline QuickStats quickAnalyse (const std::vector<float>& h, double sampleRate)
@@ -398,16 +418,40 @@ inline QuickStats quickAnalyse (const std::vector<float>& h, double sampleRate)
 
         double acc = 0.0;
         q.earlyCentreMs = (float) ((double) win * 1000.0 / sampleRate);
+        q.earlyTailMs = q.earlyCentreMs;
+        bool centreFound = false;
         for (size_t i = 0; i < win; ++i)
         {
             const double v = (double) h[q.onsetSample + i];
             acc += v * v;
-            if (acc >= 0.5 * total)
+            if (! centreFound && acc >= 0.5 * total)
             {
                 q.earlyCentreMs = (float) ((double) i * 1000.0 / sampleRate);
+                centreFound = true;
+            }
+            if (acc >= 0.8 * total)
+            {
+                q.earlyTailMs = (float) ((double) i * 1000.0 / sampleRate);
                 break;
             }
         }
+    }
+
+    {
+        const auto bin = juce::jmax<size_t> (1, (size_t) (earlyEnvBinSeconds * sampleRate));
+        std::array<double, numEarlyEnvBins> e {};
+        double loudest = 0.0;
+        for (int b = 0; b < numEarlyEnvBins; ++b)
+        {
+            const size_t from = q.onsetSample + (size_t) b * bin;
+            for (size_t i = from; i < from + bin && i < h.size(); ++i)
+                e[(size_t) b] += (double) h[i] * (double) h[i];
+            loudest = juce::jmax (loudest, e[(size_t) b]);
+        }
+        for (int b = 0; b < numEarlyEnvBins; ++b)
+            q.earlyEnvDb[(size_t) b] = (float) juce::jmax (
+                -40.0, 10.0 * std::log10 (juce::jmax (1.0e-30, e[(size_t) b])
+                                          / juce::jmax (1.0e-30, loudest)));
     }
 
     {
@@ -456,6 +500,8 @@ inline Features analyse (const float* ir, int numSamples, double sampleRate)
 
     f.onsetSeconds = q.onsetSeconds;
     f.earlyCentreMs = q.earlyCentreMs;
+    f.earlyTailMs = q.earlyTailMs;
+    f.earlyEnvDb = q.earlyEnvDb;
     f.echoDensityMs = q.echoDensityMs;
     f.earlyLateDb = q.earlyLateDb;
 

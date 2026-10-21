@@ -152,7 +152,8 @@ inline constexpr const char* importIr =
 inline constexpr const char* irCompare =
     "Compare: A/B the fitted reverb against convolution with the imported response "
     "itself, level-matched and latency-free, so the difference you hear is the "
-    "difference between them.";
+    "difference between them. Switching to the convolution takes about a tenth "
+    "of a second while it warms up.";
 
 // --- Header, meters, shell --------------------------------------------------
 
@@ -327,7 +328,9 @@ share the send.</p>
 frequency, its early-reflection pattern, its density and its stereo image — and fits
 the reverb's own controls to it. The result is an ordinary set of parameter values you
 can then edit, and it is one undo away. <b>COMPARE</b> A/Bs the fitted reverb against
-convolution with the response itself, level-matched and latency-free.</p>
+convolution with the response itself, level-matched and latency-free. Switching
+over to the convolution takes about a tenth of a second: it starts only when you ask
+for it, and the crossfade waits until it is running so the switch never clicks.</p>
 
 <h2>Surround and immersive</h2>
 <p>Horizon runs mono, stereo, 5.1, 7.1, 7.1.4 and 9.1.6. It is one room with a window

@@ -204,7 +204,7 @@ inline Match fitToIr (const float* ir, int numSamples, double sampleRate,
     // does not already supply. Filled in below, after the search.
     m.predelayMs = 0.0f;
 
-    // Space and Distance, alternately ----------------------------------------
+    // Space and Distance, together ------------------------------------------
     //
     // Space is found from how long the response takes to deliver its early
     // energy — the size measurement — with echo density as a secondary term
@@ -213,118 +213,138 @@ inline Match fitToIr (const float* ir, int numSamples, double sampleRate,
     // design, since a plate is denser than a live room twice its size, so on
     // its own it puts a studio and a small hall equally close to the same
     // target and picks between them by rounding. It is a real measurement of a
-    // real property, just not of size.
+    // real property, just not of size. Distance is found from the early/late
+    // energy balance.
     //
-    // The two controls interact — Distance moves the early/late balance, which
-    // moves where the early energy centres — so they are alternated rather
-    // than solved once each. Two rounds is enough; a third never moved either
-    // in testing.
+    // Through v0.8 the two were alternated: Space searched at a guessed
+    // Distance, then Distance at that Space, twice. That only works while size
+    // reads the same from any seat, and from v0.9 it does not: the halls'
+    // reflections arrive front-loaded and the tank builds out of them, so heard
+    // from close up a concert hall's early energy centres where a live room's
+    // does (59 ms against 57 at Distance 0.33), and only separates from the
+    // middle of the room back. Searching Space at the 0.35 starting guess sent
+    // a hall rendered at 0.5 five rooms out, and the alternation never left it.
+    //
+    // So the two are searched jointly on one error that carries both
+    // measurements: every room at seven seats, each refined to its own best
+    // seat, then the winner refined on both axes at once. About 135 short
+    // renders against v0.8's ~50 — a second or so more on an import that
+    // already runs off the message thread.
     const double targetCentre = juce::jmax (0.5, (double) m.target.earlyCentreMs);
+    const double targetTail = juce::jmax (0.5, (double) m.target.earlyTailMs);
     const double targetDensity = juce::jmax (1.0, (double) m.target.echoDensityMs);
     const double targetEarlyLate = (double) m.target.earlyLateDb;
 
-    m.space01 = 0.55f;
-    m.distance01 = 0.35f;
+    // One dB of early/late balance weighs about what a 10% error in the size
+    // measurement does. Density's weight came down from v0.8's 0.35: between
+    // two renders of the same room a few percent apart in decay it read 64 ms
+    // and 91 ms, and at 0.35 that noise alone cost the right answer as much as
+    // the whole error of a wrong room five models away.
+    constexpr double earlyLatePerDb = 0.10;
+    constexpr double densityWeight = 0.15;
+    constexpr double tailWeight = 0.5;
 
-    auto sizeError = [&] (const QuickStats& q)
+    // The early envelope's pattern, as a mean dB difference per bin: 10 dB of
+    // average mismatch weighs one unit. Heard from close up, a small hall's
+    // summaries agree with a studio's to within a few percent; its reflections
+    // still run on to 70 ms where the studio's stop at 38, and this is what
+    // hears that.
+    constexpr double envelopePerDb = 0.10;
+
+    auto jointError = [&] (const QuickStats& q)
     {
         const double centre = std::abs (std::log (juce::jmax (0.5, (double) q.earlyCentreMs)
                                                   / targetCentre));
+        const double tail = std::abs (std::log (juce::jmax (0.5, (double) q.earlyTailMs)
+                                                / targetTail));
         const double density = std::abs (std::log (juce::jmax (1.0, (double) q.echoDensityMs)
                                                    / targetDensity));
-        return centre + 0.35 * density;
+        const double balance = std::abs ((double) q.earlyLateDb - targetEarlyLate);
+
+        double envelope = 0.0;
+        for (int b = 0; b < numEarlyEnvBins; ++b)
+            envelope += std::abs ((double) q.earlyEnvDb[(size_t) b]
+                                  - (double) m.target.earlyEnvDb[(size_t) b]);
+        envelope /= (double) numEarlyEnvBins;
+
+        return centre + tailWeight * tail + densityWeight * density
+               + earlyLatePerDb * balance + envelopePerDb * envelope;
     };
 
-    constexpr int rounds = 2;
-    for (int round = 0; round < rounds; ++round)
+    m.space01 = 0.55f;
+    m.distance01 = 0.35f;
+    double bestErr = 1.0e30;
+
+    // A full second: the early/late split sits at 80 ms and the late energy
+    // past a second is a fraction of a dB even on a cathedral.
+    auto errorAt = [&] (float space01, float distance01)
     {
-        const float base = 0.05f + 0.325f * (float) round;
+        const auto p = detail::candidateParams (juce::jlimit (0.0f, 1.0f, space01),
+                                                m.decaySeconds,
+                                                juce::jlimit (0.0f, 1.0f, distance01));
+        const auto h = detail::render (p, 1.2, sampleRate);
+        const auto q = quickAnalyse (h, sampleRate);
+        return q.valid ? jointError (q) : 1.0e30;
+    };
 
-        // Space, over the table. Short renders: everything this stage looks at
-        // lives in the first quarter second.
+    auto consider = [&] (float space01, float distance01, double err)
+    {
+        if (err < bestErr)
         {
-            double bestErr = 1.0e30;
-            float bestSpace = m.space01;
+            bestErr = err;
+            m.space01 = juce::jlimit (0.0f, 1.0f, space01);
+            m.distance01 = juce::jlimit (0.0f, 1.0f, distance01);
+        }
+    };
 
-            auto trySpace = [&] (float space01)
+    // Every room gets its own best seat before the rooms are compared. On a
+    // shared seat grid the true room is only ever heard from the seats either
+    // side of where the source sat, and a different room that happens to land
+    // on a grid point can beat it — a studio rendered at 0.25 lost to a small
+    // hall at 0.17 that way. Half a step either side of each room's best seat
+    // puts every candidate within a twelfth of the room of its own optimum.
+    constexpr int seats = 7;
+    constexpr float seatStep = 1.0f / (float) (seats - 1);
+    for (int model = 0; model < numRoomModels; ++model)
+    {
+        const float space01 = (float) model / (float) (numRoomModels - 1);
+
+        double roomBest = 1.0e30;
+        float roomSeat = 0.0f;
+        for (int seat = 0; seat < seats; ++seat)
+        {
+            const float d = (float) seat * seatStep;
+            const double err = errorAt (space01, d);
+            if (err < roomBest)
             {
-                const auto p = detail::candidateParams (space01, m.decaySeconds, m.distance01);
-                const auto h = detail::render (p, 0.4, sampleRate);
-                const auto q = quickAnalyse (h, sampleRate);
-
-                if (! q.valid)
-                    return;
-
-                const double err = sizeError (q);
-                if (err < bestErr)
-                {
-                    bestErr = err;
-                    bestSpace = space01;
-                }
-            };
-
-            for (int model = 0; model < numRoomModels; ++model)
-            {
-                trySpace ((float) model / (float) (numRoomModels - 1));
-                report (base + 0.22f * (float) (model + 1) / (float) numRoomModels);
+                roomBest = err;
+                roomSeat = d;
             }
-
-            // The table is stepless from v0.2, so there is no reason to leave
-            // the answer parked on a model when the room being matched is
-            // between two of them.
-            const float half = 0.5f / (float) (numRoomModels - 1);
-            trySpace (juce::jlimit (0.0f, 1.0f, bestSpace - half));
-            trySpace (juce::jlimit (0.0f, 1.0f, bestSpace + half));
-
-            m.space01 = bestSpace;
         }
 
-        // Distance, from the early/late energy balance.
+        consider (space01, roomSeat, roomBest);
+        for (float side : { -0.5f, 0.5f })
         {
-            double bestErr = 1.0e30;
-            float bestDistance = m.distance01;
-
-            auto tryDistance = [&] (float d)
-            {
-                d = juce::jlimit (0.0f, 1.0f, d);
-                const auto p = detail::candidateParams (m.space01, m.decaySeconds, d);
-                const auto h = detail::render (p, 1.2, sampleRate);
-                const auto q = quickAnalyse (h, sampleRate);
-
-                if (! q.valid)
-                    return;
-
-                const double err = std::abs ((double) q.earlyLateDb - targetEarlyLate);
-                if (err < bestErr)
-                {
-                    bestErr = err;
-                    bestDistance = d;
-                }
-            };
-
-            for (int i = 0; i <= 6; ++i)
-            {
-                tryDistance ((float) i / 6.0f);
-                report (base + 0.22f + 0.09f * (float) (i + 1) / 7.0f);
-            }
-
-            // Half a step either side, but only on the last round. Refining
-            // Distance mid-alternation feeds a finer value back into the next
-            // Space search and moves it: the two are partly degenerate — a
-            // slightly larger room heard from slightly closer measures much
-            // like a smaller one heard from further away — so a small change
-            // in one can hand the other a different answer of equal quality.
-            // Doing it once, after Space has settled, keeps the refinement
-            // without letting it perturb what it is refining against.
-            if (round == rounds - 1)
-            {
-                const float halfStep = 1.0f / 12.0f;
-                tryDistance (bestDistance - halfStep);
-                tryDistance (bestDistance + halfStep);
-            }
-
-            m.distance01 = bestDistance;
+            const float d = juce::jlimit (0.0f, 1.0f, roomSeat + side * seatStep);
+            if (! juce::approximatelyEqual (d, roomSeat))
+                consider (space01, d, errorAt (space01, d));
         }
+
+        report (0.05f + 0.60f * (float) (model + 1) / (float) numRoomModels);
+    }
+
+    // The table is stepless from v0.2, so there is no reason to leave the answer
+    // parked on a model when the room being matched is between two.
+    {
+        const float halfSpace = 0.5f / (float) (numRoomModels - 1);
+        const float quarterSeat = 0.25f * seatStep;
+        const float s0 = m.space01, d0 = m.distance01;
+
+        for (int ds = -1; ds <= 1; ++ds)
+            for (int dd = -1; dd <= 1; ++dd)
+                if (ds != 0 || dd != 0)
+                    consider (s0 + (float) ds * halfSpace, d0 + (float) dd * quarterSeat,
+                              errorAt (s0 + (float) ds * halfSpace, d0 + (float) dd * quarterSeat));
     }
 
     report (0.7f);

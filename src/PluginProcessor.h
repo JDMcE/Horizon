@@ -272,6 +272,12 @@ private:
     juce::AudioBuffer<float> convolutionBuffer;
     juce::SmoothedValue<float> compareMix, compareDryWet;
 
+    // The convolver's warm-up before the A/B crossfades over to it (v0.9);
+    // see processBlock. Audio thread only.
+    static constexpr double compareWarmupSeconds = 0.12;
+    int compareWarmupLeft = 0;
+    bool convolverWarm = false;
+
     // One worker, because two simultaneous imports would race to apply two
     // states and the second would win for no reason the user could predict.
     juce::ThreadPool irPool { 1 };
