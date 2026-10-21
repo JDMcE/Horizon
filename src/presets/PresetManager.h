@@ -253,7 +253,10 @@ inline jdm::PresetProductConfig makePresetConfig()
           "bypass it. Good glue on a bus.",
           { { id::space, atModel (0) }, { id::decayTime, 0.25f },
             { id::mix, 14.0f }, { id::brightness, 52.0f },
-            { id::distance, 30.0f } } },
+            // 60 rather than v0.8's 30: at a quarter second the early cluster
+            // is most of the room, and up close it, not the tail, set the decay
+            // the preset delivered (0.21 s for the 0.25 it asks; 0.24 from here).
+            { id::distance, 60.0f } } },
 
         { "Studio Room", "Utility", "room;natural;neutral;acoustic",
           "Neutral mid-size studio room — a believable space rather than an "

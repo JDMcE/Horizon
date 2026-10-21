@@ -273,8 +273,23 @@ void HorizonAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // processor had already stopped covering for it. Written as a correction
     // the transition is continuous by construction: at zero blend the term is
     // exactly zero and the output is the engine's, bit for bit.
+    //
+    // The convolver is the exception to "both sides run at once": running it
+    // whenever a response is loaded measured 6% of a core on a 3 s response,
+    // paid by every session that ever imported one. So it starts when the A/B
+    // is asked for, and the crossfade waits for it. Through v0.8 the crossfade
+    // did not wait, and a sustained source arrived through the response's first
+    // reflections a few blocks after the switch had already handed over — a
+    // step four times anything in steady playback. 120 ms covers the onset of
+    // any response the fit can produce; the rest of the tail grows in smoothly.
     const bool comparing = irCompare.load() && irLoaded.load();
-    compareMix.setTargetValue (comparing ? 1.0f : 0.0f);
+    if (comparing && ! convolverWarm)
+    {
+        convolver.reset();   // nothing of the last audition's input survives
+        compareWarmupLeft = (int) (compareWarmupSeconds * getSampleRate());
+        convolverWarm = true;
+    }
+    compareMix.setTargetValue (comparing && compareWarmupLeft <= 0 ? 1.0f : 0.0f);
 
     const bool compareActive = comparing || compareMix.isSmoothing()
                             || compareMix.getCurrentValue() > 0.0f;
@@ -411,7 +426,15 @@ void HorizonAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         juce::dsp::AudioBlock<float> block (convolutionBuffer);
         juce::dsp::ProcessContextReplacing<float> context (block);
         convolver.process (context);
+    }
 
+    if (comparing && compareWarmupLeft > 0)
+        compareWarmupLeft -= numSamples;
+    if (! compareActive)
+        convolverWarm = false;
+
+    if (compareActive)
+    {
         const float* convL = convolutionBuffer.getReadPointer (0);
         const float* convR = convolutionBuffer.getReadPointer (1);
         const float convGain = convolutionGain.load();

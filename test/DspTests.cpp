@@ -1986,6 +1986,14 @@ void testParameterInterpolation()
     // spread of *static* random settings. Comparing automation against one
     // neutral setting would just be rediscovering that a bright small room has
     // more high-frequency energy in it than a dark cathedral.
+    //
+    // Each static setting runs as long as the hammering below (200 blocks).
+    // Through v0.8 this ran 40 — about 0.2 s, mostly onset — and compared that
+    // against a fully built tail. It only held while the tail arrived early: v0.9
+    // starts the tank after the room's first reflections, so the short window
+    // caught almost none of it and the parked figure fell from 0.023 to 0.009
+    // while the parked tail itself measured 0.030, comfortably above the 0.022
+    // the hammering reaches.
     float parked = 0.0f;
     {
         juce::Random rng (0x3d90);
@@ -2003,7 +2011,7 @@ void testParameterInterpolation()
             float previous = 0.0f;
             long n = 0;
 
-            for (int b = 0; b < 40; ++b)
+            for (int b = 0; b < 200; ++b)
             {
                 for (int i = 0; i < blockSize; ++i, ++n)
                 {
@@ -6139,7 +6147,9 @@ void testIrCompare()
         bool seeded = false;
         long n = 0;
 
-        auto isSwitchWindow = [] (int b) { return (b >= 40 && b <= 46) || (b >= 80 && b <= 86); };
+        // Switching on covers the convolver's 120 ms warm-up as well (v0.9):
+        // the crossfade itself lands about 23 blocks after the request.
+        auto isSwitchWindow = [] (int b) { return (b >= 40 && b <= 70) || (b >= 80 && b <= 86); };
         auto isReference = [] (int b) { return (b >= 20 && b <= 34) || (b >= 100 && b <= 114); };
 
         for (int b = 0; b < 120; ++b)

@@ -44,9 +44,9 @@ namespace detail
 //                      └─► input diffusion ─► FDN tank ─► late ──┘        ─► post EQ
 //                                                                         ─► mix
 //
-// The late field is a 16-line feedback delay network with a Householder
-// mixing matrix (H = I - (2/N)J: orthogonal, so the matrix is lossless and
-// every bit of decay comes from the per-line feedback gains). Each line has
+// The late field is a 16-line feedback delay network with a Hadamard mixing
+// matrix (orthogonal, so the matrix is lossless and every bit of decay comes
+// from the per-line feedback gains). Each line has
 // its own damping filter and a slow modulation offset that breaks up
 // standing modes.
 //
@@ -233,7 +233,6 @@ public:
         buildTapTables();
         buildDelayTables();
         buildDiffuserTables();
-        buildMixWeights();
         buildFeedMatrix();
         buildInjection();
 
@@ -271,6 +270,8 @@ public:
         for (auto* s : allSmoothers())
             s->reset (sampleRate, 0.02);
         smoothPredelay.reset (sampleRate, 0.05);
+        smoothStageLen.reset (sampleRate, 0.25);
+        dcR = 1.0f - juce::MathConstants<float>::twoPi * 10.0f / (float) sampleRate;
 
         // 30 ms each way, for the relocation fade only.
         fadeStep = 1.0f / juce::jmax (1.0f, 0.030f * (float) sampleRate);
@@ -297,6 +298,7 @@ public:
         for (auto* s : allSmoothers())
             s->setCurrentAndTargetValue (s->getTargetValue());
         smoothPredelay.setCurrentAndTargetValue (smoothPredelay.getTargetValue());
+        smoothStageLen.setCurrentAndTargetValue (smoothStageLen.getTargetValue());
         predelayNow = smoothPredelay.getTargetValue();
 
         deliveredRt60 = estimateDeliveredRt60();
@@ -318,7 +320,21 @@ public:
 
         inputDampState.fill (0.0f);
         tiltState.fill (0.0f);
-        modPhase.fill (0.0f);
+        // Each line starts at a different point in its own random walk, but the
+        // walk itself is seeded, so a reset engine renders the same tail every
+        // time — which the harness, and anyone bouncing a mix twice, relies on.
+        modRng = Rng (0x9e3779b9u);
+        sinePhase.fill (0.0f);
+        for (int k = 0; k < numErMods; ++k)
+            erModPhase[(size_t) k] = -1.0f + 0.5f * (float) k;
+        for (int l = 0; l < numLines; ++l)
+        {
+            const auto li = (size_t) l;
+            modPhase[li] = modRng.next01();
+            modFrom[li] = (l % 2 == 0 ? 1.0f : -1.0f) * (0.75f + 0.25f * modRng.next01());
+            modTo[li] = -modFrom[li];
+            modSegRate[li] = 1.0f;
+        }
         freezeAmount = freezeTarget;
         wetFade = 1.0f;
         relocatePending = false;
@@ -387,15 +403,35 @@ public:
         // is what turns a smooth early field into audible discrete echoes.
         charLively   = juce::jmax (0.0f, (c - 0.5f) * 2.0f);
         smoothLively.setTargetValue (charLively);
+        // How much of the late field's motion is periodic: none at or below
+        // the room as designed, all of it at the chorus extreme. Squared so
+        // the first half of the travel stays a room that is merely livelier.
+        smoothPeriodic.setTargetValue (charLively * charLively);
 
         // Thickness (feature 7): how densely the late field builds. It scales
         // the depth and strength of the diffusion network in front of the tank
         // — the stage that decides how quickly a single impulse becomes a
         // continuous cloud — and leans the ER/late balance with it.
         const float th = juce::jlimit (0.0f, 1.0f, p.thickness01);
-        thickStageMul = twoSided (th, 0.35f, 1.00f, 1.80f);
+        // The thick end adds fewer stages than it did through v0.8 (1.8x). Once
+        // an inactive stage stopped carrying its full length (v0.9), every extra
+        // stage is real delay as well as density: at 1.8x the onset was smeared
+        // over so long that the 5-50 ms window measured *spikier* than the room
+        // itself, and moving the control swept more delay-line length than
+        // anything else in the plugin. 1.3x builds the field just as fast
+        // (10.7 ms either way); the extra density comes from the gain below.
+        thickStageMul = twoSided (th, 0.35f, 1.00f, 1.30f);
         thickGainMul  = twoSided (th, 0.78f, 1.00f, 1.18f);
         thickLateMul  = twoSided (th, 0.88f, 1.00f, 1.16f);
+        // ...and, from v0.9, how much of the tank's input is the early field
+        // rather than the direct sound. The ER bank is already a dense cluster,
+        // so a tank built out of it is smooth from its first pass whatever the
+        // diffusers do — the harness measured the onset's spikiness flat at
+        // every Thickness, which is the control doing nothing. At 0% the tank
+        // hears only the direct sound and the thin end is sparse again.
+        // Above the midpoint it stays at the room's own figure: more early field
+        // in the tank measured no smoother at the thick end.
+        thickErTankMul = twoSided (th, 0.00f, 1.00f, 1.00f);
 
         // Distance (feature 11), properly this time: four things move
         // together. The early reflections drop away and arrive later (you
@@ -450,7 +486,7 @@ public:
             return;
 
         std::array<float, maxChannels> dryIn {}, room {}, er {}, late {}, wet {};
-        std::array<float, maxFeeds> feed {}, dif {}, erRead {};
+        std::array<float, maxFeeds> feed {}, dif {}, erRead {}, erTank {};
 
         for (int i = 0; i < numSamples; ++i)
         {
@@ -505,11 +541,16 @@ public:
             const float hpCoeff   = smoothHpCoeff.getNextValue();
             const float diffGain  = smoothDiffGain.getNextValue();
             const float stages    = smoothStages.getNextValue();
+            const float stageLen  = smoothStageLen.getNextValue();
             const float erScale   = smoothErTime.getNextValue();
             const float wetTrim   = smoothWetTrim.getNextValue();
             const float modScale  = smoothModDepth.getNextValue();
             const float inDamp    = smoothInputDamp.getNextValue();
             const float lively    = smoothLively.getNextValue();
+            const float lateOnset = smoothLateOnset.getNextValue();
+            const float periodicW = smoothPeriodic.getNextValue();
+            const float directW   = smoothDirectW.getNextValue();
+            const float erTankW   = smoothErTankW.getNextValue();
 
             // Input ----------------------------------------------------------
             // Predelay and Distance's air absorption run per *input* channel,
@@ -553,11 +594,38 @@ public:
             // output" and "right to right", which is v0.6's bank unchanged.
             for (int w = 0; w < numTank; ++w)
                 er[(size_t) w] = 0.0f;
+            for (int f = 0; f < numFeeds; ++f)
+                erTank[(size_t) f] = 0.0f;
+
+            // At Character's chorus extreme the reflections are modulated too
+            // (v0.9). Through v0.8 an unmodulated early field could sit beside
+            // a chorused tail, but the v0.9 halls carry louder reflections and
+            // a tank whose matrix spreads every pass across all sixteen lines —
+            // which averages the per-line detune where the old reflection let
+            // it compound — so at Distance 0 the static reflections held a tone
+            // 0.92 concentrated with the tail fully chorused. Four shared
+            // modulators at incommensurate rates; each tap rides one of them,
+            // lengthening only (so the shortest tap never reads ahead of the
+            // write), by up to `erChorusMs`. Zero at and below the midpoint.
+            std::array<float, numErMods> erMod {};
+            if (periodicW > 0.0f)
+            {
+                const float depth = erChorusMs * 0.001f * (float) sampleRate * periodicW;
+                for (int k = 0; k < numErMods; ++k)
+                {
+                    const auto ki = (size_t) k;
+                    erModPhase[ki] += erModInc[ki];
+                    if (erModPhase[ki] >= 1.0f)
+                        erModPhase[ki] -= 2.0f;
+                    const float ph = erModPhase[ki];
+                    erMod[ki] = depth * (1.0f + 4.0f * ph * (1.0f - std::abs (ph)));
+                }
+            }
 
             for (int t = 0; t < erTapLimit; ++t)
             {
                 const auto ti = (size_t) t;
-                const float dt = tapTime[ti] * erScale;
+                const float dt = tapTime[ti] * erScale + erMod[ti % (size_t) numErMods];
 
                 for (int f = 0; f < numFeeds; ++f)
                     erRead[(size_t) f] = erLines[(size_t) f].read (dt);
@@ -567,6 +635,14 @@ public:
                 // speaker's share of this tap equally, so it belongs on the tap
                 // and not on the fan-out. See updateErGains.
                 const float livelyScale = 1.0f + lively * tapLively[ti];
+
+                // The same reflections, kept per feed for the tank (v0.9). One
+                // mono gain per tap rather than the speaker fan-out: the tank
+                // only needs to know which side of the room a reflection came
+                // from, and the feed already says that.
+                const float tg = tapTank[ti] * livelyScale;
+                for (int f = 0; f < numFeeds; ++f)
+                    erTank[(size_t) f] += tg * erRead[(size_t) f];
 
                 for (int s = 0; s < numErSources; ++s)
                 {
@@ -588,13 +664,36 @@ public:
             // Every stage always runs so its buffer stays warm; `stages`
             // crossfades each one in and out, which is what lets diffusion
             // depth be a continuous, morphable, automatable quantity.
+            //
+            // What goes in is the v0.9 handover: the direct sound, held back by
+            // the room's late onset (read from the ER line, which already holds
+            // it), plus the early reflections themselves. The tail therefore
+            // starts after the first reflections and is built out of them, which
+            // is the difference between a room and a plate with taps on it. At
+            // an onset of zero the read is the sample just pushed, so a plate's
+            // input is exactly what it was.
             for (int f = 0; f < numFeeds; ++f)
-                dif[(size_t) f] = feed[(size_t) f];
+            {
+                const auto fi = (size_t) f;
+                const float in = erLines[fi].read (lateOnset * erScale) * directW
+                                 + erTank[fi] * erTankW;
+
+                // DC blocker (~10 Hz). The Hadamard matrix passes the
+                // all-lines-equal direction round the loop like any other,
+                // where the old Householder reflection inverted it every pass
+                // and so could never accumulate DC. Keeping it out of the tank
+                // at the door is the conventional answer and costs nothing
+                // audible.
+                dif[fi] = in - dcX[fi] + dcR * dcY[fi];
+                dcX[fi] = in;
+                dcY[fi] = dif[fi];
+            }
 
             for (int s = 0; s < numDiffusers; ++s)
             {
                 const auto si = (size_t) s;
                 const float w = juce::jlimit (0.0f, 1.0f, stages - (float) s);
+                const float lenW = juce::jlimit (0.0f, 1.0f, stageLen - (float) s);
 
                 // A stage fades in through its own *coefficient*, not through a
                 // dry/wet mix.
@@ -622,9 +721,27 @@ public:
                 // by a vocal booth and an arena — and it is baked into the
                 // per-feed length tables so saying so costs the loop nothing.
                 // At two feeds those tables are v0.6's L and R sets exactly.
+                //
+                // From v0.9 a stage's *length* fades in with it too. A stage with
+                // g = 0 is still a delay, and with every stage always delaying,
+                // a hall running three of its eight carried the other five as
+                // 25-45 ms of dead latency in front of the tank — the tail could
+                // not start until long after the early reflections had finished,
+                // and the gap between them was a hole. Scaling the length keeps
+                // every stage an allpass (unity magnitude at every setting, as
+                // above), and leaves an inactive one a two-sample delay.
+                //
+                // The length follows its own, much slower copy of the stage
+                // count. Moving a delay length is a pitch shift, and on the 20 ms
+                // ramp the gains use, Thickness or Character automation swept the
+                // read pointers fast enough to glitch (the automation suite
+                // measured three times the parked step). 250 ms keeps the pointer
+                // rate inside the budget the Space morph already lives within.
                 for (int f = 0; f < numFeeds; ++f)
                     dif[(size_t) f] = diffusers[(size_t) f][si].process (
-                        dif[(size_t) f], diffDelay[(size_t) f][si], diffGain * w);
+                        dif[(size_t) f],
+                        juce::jmax (2.0f, diffDelay[(size_t) f][si] * lenW),
+                        diffGain * w);
             }
 
             // FDN late field ------------------------------------------------
@@ -634,13 +751,52 @@ public:
             {
                 const auto li = (size_t) l;
 
-                modPhase[li] += modInc[li];
+                // Randomized modulation (v0.9). Through v0.8 this was a sine per
+                // line, and however incommensurate the rates, a tank of sixteen
+                // periodic wobbles is heard as chorus — the plate sheen again.
+                //
+                // Each line now swings from one side to the other along a
+                // smoothstep, like a sine's half-cycle, but every swing draws its
+                // own amplitude (0.75..1) and its own duration (0.8..1.2 of the
+                // nominal), so the motion never repeats. Uniformly random
+                // targets were tried first and measured worse: a smoothstep
+                // between them pauses at every target and often barely moves,
+                // so the modes were smeared less than the sine had smeared them
+                // and the late field's ripple rose by 2-3 dB on every room.
+                // Alternating direction keeps the excursion a sine's.
+                modPhase[li] += modInc[li] * modSegRate[li];
                 if (modPhase[li] >= 1.0f)
-                    modPhase[li] -= 2.0f;
+                {
+                    modPhase[li] -= 1.0f;
+                    modFrom[li] = modTo[li];
+                    modTo[li] = (modFrom[li] > 0.0f ? -1.0f : 1.0f)
+                                * (0.75f + 0.25f * modRng.next01());
+                    modSegRate[li] = 1.0f / (0.8f + 0.4f * modRng.next01());
+                }
 
-                // Parabolic sine approximation — ample for chorus-rate motion.
                 const float ph = modPhase[li];
-                const float lfo = 4.0f * ph * (1.0f - std::abs (ph));
+                float lfo = modFrom[li]
+                            + (modTo[li] - modFrom[li]) * ph * ph * (3.0f - 2.0f * ph);
+                lfo *= randomModGain;
+
+                // Character's top half crossfades back to the v0.8 sine. The
+                // random walk is what keeps a room from sounding like a plate,
+                // but its whole point is that it never repeats — and a chorus
+                // *is* sixteen periodic wobbles beating against one another, so
+                // the random walk alone can never reach one (the harness measured
+                // the carrier staying 0.96 concentrated at Character 100%). Below
+                // the midpoint, the room as designed, this costs nothing.
+                if (periodicW > 0.0f)
+                {
+                    sinePhase[li] += modInc[li];
+                    if (sinePhase[li] >= 1.0f)
+                        sinePhase[li] -= 2.0f;
+
+                    // Parabolic sine approximation — ample for chorus-rate motion.
+                    const float sp = sinePhase[li];
+                    const float sine = 4.0f * sp * (1.0f - std::abs (sp));
+                    lfo += (sine - lfo) * periodicW;
+                }
 
                 // Under Freeze the read glides to the nearest whole sample —
                 // at most half a sample, over the 50 ms freeze ramp — so the
@@ -704,25 +860,31 @@ public:
                 tapped[li] *= feedbackGain[li] + (1.0f - feedbackGain[li]) * frozen;
             }
 
-            // The feedback matrix, H = I - 2vv^T for the room's own reflection
-            // vector. With v uniform — every model through v0.4.2 — this is
-            // literally the old `sum * (2/N)`: v_l = 1/4, so 2*v_l*(v.x) works
-            // out at sum * 2/16, to the bit.
+            // The feedback matrix: a 16-point Hadamard, applied as a fast
+            // Walsh-Hadamard transform (four butterfly passes, 64 adds) and
+            // normalised by 1/4.
             //
-            // A reflection is orthogonal for *any* unit v, which is the whole
-            // reason the matrix could be opened up as a voicing control at all:
-            // the tank stays lossless, so Freeze still sustains forever and every
-            // bit of decay still comes from the feedback gains, at every value of
-            // `mixSkew`. What a skewed v buys is lines that couple *unevenly* —
-            // heavily weighted lines become the hubs energy crosses through, and
-            // lightly weighted ones stay nearly independent combs whose modes the
-            // ear can still pick out individually. That is the difference between
-            // a wash and a room with a character, and it is the one structural
-            // axis the engine previously had no way to express.
-            float projection = 0.0f;
-            for (int l = 0; l < numLines; ++l)
-                projection += mixV[(size_t) l] * tapped[(size_t) l];
-            projection *= 2.0f;   // the 2 in H = I - 2vv^T, folded in once
+            // Through v0.8 this was a Householder reflection I - 2vv^T, and with
+            // sixteen lines that is a matrix that barely mixes: each line keeps
+            // 0.875 of itself per pass and receives 0.125 from each of the
+            // others. The tank was sixteen loosely coupled combs, and densely
+            // packed comb modes ringing on their own is exactly the metallic
+            // sheen of a plate — which every room in the table therefore had.
+            // Every entry of a Hadamard is +/-1/4, so one pass spreads each
+            // line's energy evenly across all sixteen and the echo density
+            // grows as fast as the structure allows.
+            //
+            // It is orthogonal, so the tank stays lossless: Freeze still holds
+            // forever and every bit of decay still comes from the feedback gains.
+            std::array<float, numLines> mixed = tapped;
+            for (int h = 1; h < numLines; h <<= 1)
+                for (int a = 0; a < numLines; a += 2 * h)
+                    for (int b = a; b < a + h; ++b)
+                    {
+                        const float x = mixed[(size_t) b], y = mixed[(size_t) (b + h)];
+                        mixed[(size_t) b] = x + y;
+                        mixed[(size_t) (b + h)] = x - y;
+                    }
 
             // Freeze seals the tank; the relocation fade also gates injection,
             // because a snap steps the diffuser and ER read positions. Fading
@@ -738,8 +900,7 @@ public:
                 // is v0.5's Walsh row 4 split, so a stereo session's lines take
                 // the same halves of the tank they always did.
                 const float inject = dif[(size_t) lineFeed[li]] * injectTrimNow;
-                lines[li].push (tapped[li] - mixV[li] * projection
-                                + inject * inputGate);
+                lines[li].push (mixed[li] * hadamardScale + inject * inputGate);
             }
 
             // The late field, one Walsh row per speaker.
@@ -1022,6 +1183,16 @@ private:
     // whatever the layout. The injection trim is not — it depends on how many
     // lines each feed reaches — and lives in `injectTrimNow`; see buildInjection.
     static constexpr float outputTrim = 0.25f;    // 1/sqrt(16)
+
+    // Normalises the unscaled fast Walsh-Hadamard transform in the sample loop
+    // to an orthogonal matrix: H16 has entries +/-1, so H16/sqrt(16).
+    static constexpr float hadamardScale = 0.25f;
+
+    // The random modulation smears the modes a little less than the sine it
+    // replaced did at the same nominal depth (it spends less of each swing at
+    // full speed), which measured as 0.5-0.7 dB more late-field ripple. This is
+    // what brings it back level.
+    static constexpr float randomModGain = 1.25f;
 
     // Those two trims leave the wet path around 12 dB below the dry, which
     // makes Mix feel like a level control rather than a blend. This makeup
@@ -1456,27 +1627,6 @@ private:
         }
     }
 
-    // Unnormalized Householder weights per model. Interpolating these and
-    // normalizing the result (see updateControlRate) is what keeps the reflection
-    // vector exactly unit-length at every point in the morph, which is what the
-    // matrix needs to stay orthogonal and Freeze needs to stay lossless.
-    void buildMixWeights()
-    {
-        for (size_t mi = 0; mi < roomModels.size(); ++mi)
-        {
-            const float skew = juce::jlimit (-3.0f, 3.0f, roomModels[mi].late.mixSkew);
-            for (int l = 0; l < numLines; ++l)
-            {
-                // Positive skew weights the short lines, which makes them the
-                // hubs energy passes through and leaves the long ones — the ones
-                // carrying the low, slow, individually audible modes — closer to
-                // independent.
-                const float x = (float) l / (float) (numLines - 1) - 0.5f;
-                modelMixWeight[mi][(size_t) l] = std::exp (-skew * x);
-            }
-        }
-    }
-
     // The layout, resolved into everything the engine indexes by (v0.7).
     //
     // Two vocabularies meet here and it is worth being explicit about which is
@@ -1768,6 +1918,8 @@ private:
             d.clear();
         decayEq.reset();
         postEq.reset();
+        dcX.fill (0.0f);
+        dcY.fill (0.0f);
         // The predelay lines carry the dry input and know nothing about room
         // geometry, so they keep running.
     }
@@ -1975,6 +2127,7 @@ private:
             const auto ti = (size_t) t;
             const float fr = TA.frac[ti] + (TB.frac[ti] - TA.frac[ti]) * f;
             tapLively[ti] = 2.2f * fr;
+            tapTank[ti] = TA.amp[ti] + (TB.amp[ti] - TA.amp[ti]) * f;
         }
 
         if (numFeeds == 2)
@@ -2202,40 +2355,6 @@ private:
         postEq.update();
         postEqActive = postEq.isActive();
 
-        // The feedback matrix's reflection vector.
-        //
-        // Interpolate the two neighbouring models' weights, then normalize — that
-        // order matters. Normalizing after the blend makes v exactly unit-length
-        // at every point in the morph, so the matrix is exactly orthogonal
-        // everywhere rather than only at the fourteen table entries; blending two
-        // already-normalized vectors would leave it short by up to a percent in
-        // between, and a tank whose matrix loses a percent per pass is not a tank
-        // Freeze can hold.
-        //
-        // Control rate is the right rate for it for the same reason it is right
-        // for the feedback gains: a step in a mixing coefficient is a
-        // multiplication on an already-smooth signal, and holding v fixed between
-        // ticks means it is always precisely the normalized vector rather than a
-        // per-sample interpolate that would drift off the unit sphere.
-        {
-            const auto& WA = modelMixWeight[(size_t) morphLow];
-            const auto& WB = modelMixWeight[(size_t) morphHigh];
-            const float f = morphFrac;
-
-            float norm = 0.0f;
-            for (int l = 0; l < numLines; ++l)
-            {
-                const auto li = (size_t) l;
-                const float w = WA[li] + (WB[li] - WA[li]) * f;
-                mixV[li] = w;
-                norm += w * w;
-            }
-
-            const float inv = 1.0f / std::sqrt (juce::jmax (1.0e-12f, norm));
-            for (int l = 0; l < numLines; ++l)
-                mixV[(size_t) l] *= inv;
-        }
-
         // The late field's spatial correlation — a stereo image below three
         // speakers and a cross-feed matrix above it, from the same room field
         // and through the same construction. See buildOutputVectors.
@@ -2271,16 +2390,39 @@ private:
         modDetuneNow = m.modDetune * (sA + (sB - sA) * morphFrac);
         smoothModDepth.setTargetValue (charDepthMul);
         for (int l = 0; l < numLines; ++l)
+            // One random target per half-period: the time a sine at this rate
+            // takes to sweep from peak to trough, so the speed of the motion
+            // matches what the rate column was voiced against.
             modInc[(size_t) l] = 2.0f * m.modRateHz * charRateMul
                                  * modRateScale[(size_t) l] / (float) sampleRate;
 
+        // The early field's chorus rates: fixed and incommensurate, scaled by
+        // Character like the tank's, so neighbouring taps never move in step.
+        {
+            constexpr float erModHz[numErMods] { 0.83f, 1.19f, 1.57f, 2.11f };
+            for (int k = 0; k < numErMods; ++k)
+                erModInc[(size_t) k] = 2.0f * erModHz[k] * charRateMul / (float) sampleRate;
+        }
+
         smoothErLevel.setTargetValue (m.erLevel * charErMul * distErMul);
+
+        // The handover weights are power-complementary: the ER bank carries
+        // `erBankPower` of its input's energy, so scaling it by
+        // sqrt(x / erBankPower) makes it exactly x of what reaches the tank and
+        // the direct share sqrt(1 - x) makes up the rest. The tail's level, and
+        // with it the wet calibration, is the same at every setting.
+        const float toLate = juce::jlimit (0.0f, 0.9f, m.erToLate * thickErTankMul);
+        smoothDirectW.setTargetValue (std::sqrt (1.0f - toLate));
+        smoothErTankW.setTargetValue (std::sqrt (toLate / erBankPower));
+        smoothLateOnset.setTargetValue (juce::jmax (0.0f, m.lateOnsetMs) * 0.001f
+                                        * (float) sampleRate);
         smoothLateLevel.setTargetValue (m.lateLevel * distLateMul * thickLateMul);
 
         smoothDiffGain.setTargetValue (juce::jlimit (0.20f, 0.82f,
             (0.45f + 0.35f * m.diffusion) * charDiffMul * thickGainMul));
         smoothStages.setTargetValue (juce::jlimit (1.0f, (float) numDiffusers,
             m.diffuseStages * charStageMul * thickStageMul));
+        smoothStageLen.setTargetValue (smoothStages.getTargetValue());
 
         updateErGains();
     }
@@ -2323,12 +2465,13 @@ private:
             reset();
     }
 
-    std::array<juce::SmoothedValue<float>*, 14> allSmoothers() noexcept
+    std::array<juce::SmoothedValue<float>*, 18> allSmoothers() noexcept
     {
         return { &smoothMix, &smoothWidth, &smoothErLevel, &smoothLateLevel,
                  &smoothTilt, &smoothLpCoeff, &smoothHpCoeff, &smoothDiffGain,
                  &smoothStages, &smoothErTime, &smoothWetTrim, &smoothModDepth,
-                 &smoothInputDamp, &smoothLively };
+                 &smoothInputDamp, &smoothLively, &smoothLateOnset, &smoothDirectW,
+                 &smoothErTankW, &smoothPeriodic };
     }
 
     double sampleRate = 48000.0;
@@ -2350,17 +2493,7 @@ private:
     std::array<float, numLines> delaySamples {};
     std::array<std::array<float, numDiffusers>, maxFeeds> diffDelay {};
 
-    // The feedback matrix's reflection vector: one hot array, and the only one
-    // v0.5 adds to the sample loop.
-    //
-    // Getting it down to one took two rewrites. The doubling in H = I - 2vv^T is
-    // folded into the projection scalar rather than kept as a second vector, and
-    // the stereo rotation is applied to the two output sums instead of to the
-    // vectors feeding them (see the sample loop), which keeps both Walsh rows
-    // constexpr. The first cut held five runtime arrays here and cost the neutral
-    // engine 60% of its budget for it.
-    std::array<float, numLines> mixV {};
-    std::array<float, maxErTaps> tapTime {}, tapLively {};
+    std::array<float, maxErTaps> tapTime {}, tapLively {}, tapTank {};
     int erTapLimit = 0;
 
     // The early bank's routing, rebuilt at control rate: for each tap, up to two
@@ -2380,7 +2513,12 @@ private:
     std::array<DelayLine, numLines> lines;
     std::array<DampingFilter, numLines> damping {};
     std::array<float, numLines> modInc {};
-    std::array<float, numLines> modPhase {};
+    std::array<float, numLines> modPhase {}, modFrom {}, modTo {}, modSegRate {};
+    std::array<float, numLines> sinePhase {};
+    static constexpr int numErMods = 4;
+    static constexpr float erChorusMs = 2.0f;
+    std::array<float, numErMods> erModPhase {}, erModInc {};
+    Rng modRng { 0x9e3779b9u };
     std::array<float, numLines> feedbackGain {};
 
     // Per-line damping shelf gains (v0.7.1). One shared pair only delivers the
@@ -2423,7 +2561,11 @@ private:
     juce::SmoothedValue<float> smoothMix, smoothWidth, smoothErLevel, smoothLateLevel,
                                smoothPredelay, smoothTilt, smoothLpCoeff, smoothHpCoeff,
                                smoothDiffGain, smoothStages, smoothErTime, smoothWetTrim,
-                               smoothModDepth, smoothInputDamp, smoothLively;
+                               smoothModDepth, smoothInputDamp, smoothLively,
+                               smoothLateOnset, smoothDirectW, smoothErTankW,
+                               smoothStageLen, smoothPeriodic;
+    std::array<float, maxFeeds> dcX {}, dcY {};
+    float dcR = 0.9987f;
 
     // Block-rate derived control values ---------------------------------------
     float decaySecondsTarget = 2.0f, brightnessRatioMul = 1.0f;
@@ -2432,6 +2574,7 @@ private:
     float charErMul = 1.0f, charDepthMul = 1.0f, charRateMul = 1.0f;
     float charDiffMul = 1.0f, charStageMul = 1.0f, charLively = 0.0f;
     float thickStageMul = 1.0f, thickGainMul = 1.0f, thickLateMul = 1.0f;
+    float thickErTankMul = 1.0f;
     float distErMul = 1.0f, distLateMul = 1.0f;
 
     float currentRt60 = 1.0f, targetRt60 = 1.0f, deliveredRt60 = 1.0f, rt60Slew = 0.05f;
@@ -2462,7 +2605,6 @@ private:
     // sections describes. Cold data goes at the end.
     std::array<std::array<float, numLines>, roomModels.size()> modelDelaySamples {};
     std::array<std::array<std::array<float, numDiffusers>, roomModels.size()>, maxFeeds> modelDiff {};
-    std::array<std::array<float, numLines>, roomModels.size()> modelMixWeight {};
 
     // What the density floor did to each model's modulation depth. 1.0 for
     // every room already above the floor, which is everything from the Chamber

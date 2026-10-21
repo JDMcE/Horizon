@@ -88,32 +88,6 @@ struct LateShape
     // most of what a plate is and a hall can have a long loose one.
     float diffMeanMs;   // geometric-mean diffuser length
     float diffSpread;   // exponent on their spread, as lineSpread is for the tank
-
-    // Skew of the feedback matrix's reflection vector. 0 is the classic
-    // I - (2/N)J that every room used through v0.4.2.
-    //
-    // The matrix stays a Householder reflection H = I - 2vv^T, which is
-    // orthogonal for *any* unit v — so the lossless-tank invariant Freeze
-    // depends on, and the rule that every bit of decay comes from the feedback
-    // gains, hold at every value of this field. What changes is how evenly the
-    // lines couple: v uniform mixes all sixteen equally and maximally, which is
-    // the smooth wash v0.4.2 gave every room, while a skewed v makes the
-    // large-weight lines hubs and leaves the small-weight ones nearly
-    // independent, so their modes stay individually audible.
-    //
-    // Its range is deliberately small, and finding out why cost a round of
-    // measurements. Uneven coupling buys individually audible modes — character —
-    // but it buys them by *reducing inter-line interaction*, and inter-line
-    // interaction is what modulated lines beating against one another is made of.
-    // That is the same mechanism as the tank's shimmer and as Character's chorus
-    // extreme. The first cut of this table skewed the large rooms hard, and the
-    // harness caught the consequence exactly: Boundless's held-tone concentration
-    // went from 0.67 to 0.97 — it stopped shimmering — and Character 100% stopped
-    // reaching a chorus at all. So the large, lush rooms stay near uniform, where
-    // their lushness comes from, and what skew there is belongs to the small and
-    // medium rooms, which want to sound like a place with walls and have the
-    // coloration headroom to pay for it.
-    float mixSkew;
 };
 
 // Per-room stereo behaviour. Both of these were hardcoded constants shared by
@@ -128,6 +102,29 @@ struct StereoShape
     // lines each output actually sums, so a small room's tail is *intrinsically*
     // narrower rather than turned down.
     float lateCorrelation; // 0 .. 1
+};
+
+// How the early field hands over to the late one.
+//
+// Through v0.8 the two were parallel and unrelated: the ER bank went straight
+// to the output and the tank was fed from the diffusers, so a hall's tail began
+// as soon as its shortest line came round, with no relation to the reflections
+// in front of it. What came out was a wash with an echo pattern laid on top —
+// a plate with some taps, not a room. In a room the reflections *are* the start
+// of the reverberation: each one goes on bouncing, and the diffuse tail is what
+// they turn into.
+struct TransitionShape
+{
+    // How long after the onset the direct sound starts feeding the tank. The
+    // reflections in that gap are heard as discrete events before the tail
+    // arrives underneath them. Zero for a plate, which has no walls to hear.
+    float lateOnsetMs;
+
+    // Fraction of the tank's input energy that comes from the ER bank rather
+    // than from the direct sound, so the tail grows out of the room's own
+    // reflection pattern. The two are power-normalized against each other, so
+    // this changes what the tail is made of and never how loud it is.
+    float erToLate;     // 0 .. 0.9
 };
 
 // One room model: a geometry record, not a preset. Space (feature 8) is a
@@ -198,6 +195,9 @@ struct RoomModel
     ErShape     er;
     LateShape   late;
     StereoShape stereo;
+
+    // v0.9, appended for the same reason.
+    TransitionShape transition;
 };
 
 // Fourteen models spanning tight ambience to a cathedral. Sizes and decay
@@ -262,47 +262,40 @@ struct RoomModel
 // tank smears the onset of a large room into mush, which is the trap the old
 // size-derived clamp was clumsily avoiding.
 //
-// **late.mixSkew.** Positive weights the short lines as the hubs energy crosses
-// through, which leaves the long lines — the ones carrying the slow low modes —
-// nearly independent and individually audible: a room with a character rather
-// than a wash. Negative does the reverse, leaving the *short* lines free to ring,
-// which reads as metallic and is why the plates are the only negative entries.
-// The halls sit mildly positive, small rooms further up.
-//
 // **stereo.** A vocal booth and an arena shared a 1.061 diffuser detune and a
 // fully decorrelated tail through v0.4.2. Now the small rooms are intrinsically
 // narrow and correlated, as a small room is, and the image opens with size.
 //                                       size    rt60   diff  stages  erMs  taps   erLv  lateLv detune modHz    hfHz  hfRatio    lfHz  lfRatio  seed
-//                                                       er: clust  decay  discr   pan      late: spread  diffMs  dSprd   skew     stereo: detune  corr
+//                                                       er: clust  decay  discr   pan      late: spread  diffMs  dSprd     stereo: detune  corr   onset erToLate
 inline constexpr std::array<RoomModel, 14> roomModels { {
-    { "Ambience",     Core::sparse, 0.045f,  0.28f, 0.56f, 4.4f,  16.0f,  8, 1.05f, 0.30f, 0.0030f, 1.20f, 11000.0f, 0.62f, 260.0f, 0.56f, 0x1234u,
-      { 1.00f, 1.5f, 0.85f, 0.55f }, { 0.96f,   1.3f, 0.70f,  0.34f }, { 1.020f, 0.40f } },
-    { "Small Room",   Core::sparse, 0.085f,  0.45f, 0.54f, 4.0f,  28.0f,  9, 0.92f, 0.52f, 0.0035f, 1.05f,  9500.0f, 0.55f, 235.0f, 0.60f, 0x2f19u,
-      { 0.95f, 1.7f, 0.80f, 0.65f }, { 1.04f,   1.8f, 0.78f,  0.38f }, { 1.028f, 0.33f } },
-    { "Studio",       Core::sparse, 0.130f,  0.65f, 0.60f, 4.2f,  38.0f, 12, 0.80f, 0.70f, 0.0045f, 0.88f,  9000.0f, 0.52f, 210.0f, 0.65f, 0x51a3u,
-      { 0.90f, 2.0f, 0.65f, 0.75f }, { 1.09f,   2.4f, 0.85f,  0.36f }, { 1.038f, 0.25f } },
-    { "Live Room",    Core::hall,   0.190f,  0.90f, 0.66f, 4.6f,  48.0f, 16, 0.72f, 0.86f, 0.0060f, 0.80f,  8800.0f, 0.60f, 190.0f, 0.71f, 0x7c42u,
-      { 0.85f, 2.2f, 0.50f, 0.85f }, { 1.13f,   3.2f, 0.92f,  0.30f }, { 1.048f, 0.17f } },
-    { "Chamber",      Core::dense,  0.250f,  1.25f, 0.77f, 6.8f,  55.0f, 14, 0.50f, 1.00f, 0.0100f, 0.72f,  8000.0f, 0.46f, 170.0f, 0.77f, 0x9d31u,
-      { 0.80f, 2.4f, 0.25f, 0.90f }, { 1.00f,   2.6f, 0.76f,  0.18f }, { 1.055f, 0.12f } },
+    { "Ambience",     Core::sparse, 0.045f,  0.28f, 0.40f, 2.0f,  16.0f,  8, 1.05f, 0.30f, 0.0030f, 1.20f, 11000.0f, 0.62f, 260.0f, 0.56f, 0x1234u,
+      { 1.00f, 1.5f, 0.85f, 0.55f }, { 0.96f, 1.0f, 0.70f }, { 1.020f, 0.40f }, {  0.5f, 0.30f } },
+    { "Small Room",   Core::sparse, 0.085f,  0.45f, 0.42f, 2.2f,  28.0f,  9, 0.92f, 0.52f, 0.0035f, 1.05f,  9500.0f, 0.55f, 235.0f, 0.60f, 0x2f19u,
+      { 0.95f, 1.7f, 0.80f, 0.65f }, { 1.04f, 1.4f, 0.78f }, { 1.028f, 0.33f }, {  1.0f, 0.35f } },
+    { "Studio",       Core::sparse, 0.130f,  0.65f, 0.45f, 2.4f,  38.0f, 12, 0.80f, 0.70f, 0.0045f, 0.88f,  9000.0f, 0.52f, 210.0f, 0.65f, 0x51a3u,
+      { 0.90f, 2.0f, 0.65f, 0.75f }, { 1.09f, 1.8f, 0.85f }, { 1.038f, 0.25f }, {  2.0f, 0.40f } },
+    { "Live Room",    Core::hall,   0.190f,  0.90f, 0.48f, 2.6f,  48.0f, 16, 0.72f, 0.86f, 0.0060f, 0.80f,  8800.0f, 0.60f, 190.0f, 0.71f, 0x7c42u,
+      { 0.85f, 2.2f, 0.50f, 0.85f }, { 1.13f, 2.2f, 0.92f }, { 1.048f, 0.17f }, {  3.0f, 0.45f } },
+    { "Chamber",      Core::dense,  0.250f,  1.25f, 0.70f, 5.0f,  55.0f, 14, 0.60f, 1.00f, 0.0100f, 0.72f,  8000.0f, 0.46f, 170.0f, 0.77f, 0x9d31u,
+      { 0.80f, 2.4f, 0.35f, 0.90f }, { 1.00f, 2.2f, 0.76f }, { 1.055f, 0.12f }, {  4.0f, 0.40f } },
     { "Bright Plate", Core::dense,  0.220f,  1.60f, 0.86f, 7.8f,  26.0f,  4, 0.24f, 1.06f, 0.0110f, 1.45f, 13000.0f, 0.74f, 215.0f, 0.63f, 0xb60fu,
-      { 0.72f, 2.8f, 0.20f, 0.95f }, { 0.92f,   1.6f, 0.56f, -0.20f }, { 1.076f, 0.05f } },
+      { 0.72f, 2.8f, 0.20f, 0.95f }, { 0.92f, 1.6f, 0.56f }, { 1.076f, 0.05f }, {  0.0f, 0.00f } },
     { "Warm Plate",   Core::dense,  0.260f,  2.00f, 0.87f, 8.0f,  32.0f,  4, 0.24f, 1.06f, 0.0110f, 1.20f,  6800.0f, 0.34f, 180.0f, 0.67f, 0xd7e8u,
-      { 0.72f, 2.7f, 0.20f, 0.95f }, { 0.94f,   1.9f, 0.58f, -0.18f }, { 1.076f, 0.05f } },
-    { "Small Hall",   Core::hall,   0.380f,  1.80f, 0.72f, 5.4f,  70.0f, 20, 0.58f, 1.00f, 0.0115f, 0.64f,  7800.0f, 0.46f, 148.0f, 0.83f, 0xf2b7u,
-      { 0.78f, 2.5f, 0.18f, 0.95f }, { 1.11f,   4.2f, 1.00f,  0.14f }, { 1.062f, 0.10f } },
-    { "Concert Hall", Core::hall,   0.560f,  2.40f, 0.74f, 5.6f,  92.0f, 24, 0.48f, 1.00f, 0.0140f, 0.54f,  7200.0f, 0.41f, 125.0f, 0.88f, 0x1a95u,
-      { 0.75f, 2.6f, 0.12f, 1.00f }, { 1.05f,   5.2f, 1.04f,  0.10f }, { 1.070f, 0.06f } },
-    { "Large Hall",   Core::hall,   0.720f,  3.20f, 0.77f, 5.8f, 112.0f, 28, 0.41f, 1.00f, 0.0170f, 0.47f,  6800.0f, 0.36f, 108.0f, 0.92f, 0x3c73u,
-      { 0.75f, 2.6f, 0.10f, 1.00f }, { 1.13f,   6.0f, 1.08f,  0.10f }, { 1.078f, 0.04f } },
-    { "Arena",        Core::hall,   0.900f,  4.20f, 0.80f, 6.0f, 140.0f, 30, 0.36f, 1.00f, 0.0200f, 0.41f,  6400.0f, 0.32f,  95.0f, 0.94f, 0x5e51u,
-      { 0.75f, 2.6f, 0.08f, 1.00f }, { 1.03f,   6.8f, 1.10f,  0.09f }, { 1.085f, 0.03f } },
-    { "Cathedral",    Core::hall,   1.150f,  6.00f, 0.82f, 6.2f, 172.0f, 32, 0.31f, 1.00f, 0.0230f, 0.35f,  6000.0f, 0.27f,  85.0f, 0.95f, 0x802fu,
-      { 0.75f, 2.6f, 0.06f, 1.00f }, { 1.12f,   7.6f, 1.12f,  0.08f }, { 1.092f, 0.02f } },
-    { "Vast Space",   Core::hall,   1.450f,  9.00f, 0.84f, 6.4f, 205.0f, 32, 0.27f, 1.00f, 0.0250f, 0.29f,  5600.0f, 0.23f,  78.0f, 0.95f, 0xa20du,
-      { 0.75f, 2.6f, 0.05f, 1.00f }, { 1.06f,   8.2f, 1.14f,  0.07f }, { 1.098f, 0.02f } },
-    { "Boundless",    Core::hall,   1.800f, 14.00f, 0.86f, 6.6f, 245.0f, 32, 0.22f, 1.00f, 0.0280f, 0.25f,  5200.0f, 0.19f,  70.0f, 0.95f, 0xc3ebu,
-      { 0.75f, 2.6f, 0.04f, 1.00f }, { 1.08f,   8.8f, 1.15f,  0.06f }, { 1.105f, 0.02f } },
+      { 0.72f, 2.7f, 0.20f, 0.95f }, { 0.94f, 1.9f, 0.58f }, { 1.076f, 0.05f }, {  0.0f, 0.00f } },
+    { "Small Hall",   Core::hall,   0.500f,  1.80f, 0.50f, 2.8f,  70.0f, 20, 0.80f, 1.00f, 0.0115f, 0.64f,  7800.0f, 0.46f, 148.0f, 0.83f, 0xf2b7u,
+      { 1.00f, 1.6f, 0.32f, 0.95f }, { 1.11f, 2.6f, 1.00f }, { 1.062f, 0.10f }, {  2.0f, 0.55f } },
+    { "Concert Hall", Core::hall,   0.800f,  2.40f, 0.52f, 3.0f,  92.0f, 24, 0.75f, 1.00f, 0.0140f, 0.54f,  7200.0f, 0.41f, 125.0f, 0.88f, 0x1a95u,
+      { 1.00f, 1.6f, 0.30f, 1.00f }, { 1.05f, 3.0f, 1.04f }, { 1.070f, 0.06f }, {  3.0f, 0.60f } },
+    { "Large Hall",   Core::hall,   0.950f,  3.20f, 0.54f, 3.0f, 112.0f, 28, 0.70f, 1.00f, 0.0170f, 0.47f,  6800.0f, 0.36f, 108.0f, 0.92f, 0x3c73u,
+      { 1.00f, 1.6f, 0.30f, 1.00f }, { 1.13f, 3.4f, 1.08f }, { 1.078f, 0.04f }, {  4.0f, 0.60f } },
+    { "Arena",        Core::hall,   1.100f,  4.20f, 0.55f, 3.2f, 140.0f, 30, 0.62f, 1.00f, 0.0200f, 0.41f,  6400.0f, 0.32f,  95.0f, 0.94f, 0x5e51u,
+      { 1.00f, 1.6f, 0.28f, 1.00f }, { 1.03f, 3.8f, 1.10f }, { 1.085f, 0.03f }, {  5.0f, 0.65f } },
+    { "Cathedral",    Core::hall,   1.300f,  6.00f, 0.56f, 3.2f, 172.0f, 32, 0.58f, 1.00f, 0.0230f, 0.35f,  6000.0f, 0.27f,  85.0f, 0.95f, 0x802fu,
+      { 1.00f, 1.6f, 0.28f, 1.00f }, { 1.12f, 4.2f, 1.12f }, { 1.092f, 0.02f }, {  6.0f, 0.65f } },
+    { "Vast Space",   Core::hall,   1.550f,  9.00f, 0.58f, 3.4f, 205.0f, 32, 0.52f, 1.00f, 0.0250f, 0.29f,  5600.0f, 0.23f,  78.0f, 0.95f, 0xa20du,
+      { 1.00f, 1.6f, 0.26f, 1.00f }, { 1.06f, 4.6f, 1.14f }, { 1.098f, 0.02f }, {  7.0f, 0.70f } },
+    { "Boundless",    Core::hall,   1.850f, 14.00f, 0.60f, 3.6f, 245.0f, 32, 0.46f, 1.00f, 0.0280f, 0.25f,  5200.0f, 0.19f,  70.0f, 0.95f, 0xc3ebu,
+      { 1.00f, 1.6f, 0.26f, 1.00f }, { 1.08f, 5.0f, 1.15f }, { 1.105f, 0.02f }, {  8.0f, 0.70f } },
 } };
 
 inline constexpr int numRoomModels = (int) roomModels.size();
@@ -348,12 +341,15 @@ struct MorphedModel
     float lfDampHz;
     float lfDecayRatio;
 
-    // The two v0.5 fields that are genuinely control-rate. The rest of the new
+    // The v0.5 field that is genuinely control-rate. The rest of the new
     // geometry — the ER shape, the line spread, the diffuser lengths and the L/R
     // diffuser detune — is baked into tables precomputed per model at prepare()
     // time and interpolated per sample, so none of it needs a scalar here.
-    float mixSkew;
     float lateCorrelation;
+
+    // The v0.9 handover. Both are smoothed per sample in the engine.
+    float lateOnsetMs;
+    float erToLate;
 };
 
 // Geometric interpolation, for the quantities the ear hears as ratios: decay
@@ -401,12 +397,11 @@ inline MorphedModel morphBetween (int lowIndex, int highIndex, float f) noexcept
     m.hfDecayRatio  = lerpGeometric (A.hfDecayRatio, B.hfDecayRatio, f);
     m.lfDecayRatio  = lerpGeometric (A.lfDecayRatio, B.lfDecayRatio, f);
 
-    // Both are signed or zero-based quantities describing a shape rather than a
-    // ratio a listener hears proportionally, so both interpolate linearly. A
-    // geometric blend of `mixSkew` would not even be defined at 0, which is the
-    // value most of the table sits at.
-    m.mixSkew         = lerpLinear (A.late.mixSkew, B.late.mixSkew, f);
+    // A zero-based quantity describing a shape rather than a ratio a listener
+    // hears proportionally, so it interpolates linearly.
     m.lateCorrelation = lerpLinear (A.stereo.lateCorrelation, B.stereo.lateCorrelation, f);
+    m.lateOnsetMs     = lerpLinear (A.transition.lateOnsetMs, B.transition.lateOnsetMs, f);
+    m.erToLate        = lerpLinear (A.transition.erToLate, B.transition.erToLate, f);
     return m;
 }
 
